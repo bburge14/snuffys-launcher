@@ -1778,18 +1778,22 @@ function Update-Plugins {
         return
     }
     $old = (git -C $root rev-parse HEAD 2>$null)
-    # From the branch's upstream, else origin's branch of the same name (a checkout without one set still updates)
-    git -C $root rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        $out = (git -C $root pull --ff-only 2>&1 | Out-String)
-    } else {
-        $branch = (git -C $root rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
-        $out = (git -C $root pull --ff-only origin $branch 2>&1 | Out-String)
+    # This copy is always the repository's: fetch it and match it exactly. Anything changed here in git's files (a
+    # rebuilt installer, an edit) is put back to the repository's; files git doesn't track (settings, caches, logs) stay
+    $upstream = Get-Upstream
+    $out = (git -C $root fetch --quiet origin 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0 -or -not $upstream) {
+        $updateStatus.Text = "Code: couldn't update"
+        $updateStatus.ForeColor = $red
+        $updateLog.Text = "Couldn't reach the repository (offline?): launching the version you have.`r`n" + $out.Trim()
+        return
     }
+    $local = @(git -C $root status --porcelain --untracked-files=no 2>$null | Where-Object { $_ })
+    $out = (git -C $root reset --hard $upstream 2>&1 | Out-String)
     if ($LASTEXITCODE -ne 0) {
         $updateStatus.Text = "Code: couldn't update"
         $updateStatus.ForeColor = $red
-        $updateLog.Text = "Couldn't update (offline, or files changed here):`r`n" + $out.Trim()
+        $updateLog.Text = "Couldn't match the repository:`r`n" + $out.Trim()
         return
     }
     $new = (git -C $root rev-parse HEAD 2>$null)
@@ -1801,6 +1805,9 @@ function Update-Plugins {
         $updateStatus.Text = 'Code: just updated'
         $updateStatus.ForeColor = $green
         $updateLog.Text = "Just updated:`r`n" + (Get-Changes "$old..$new").Text
+    }
+    if ($local) {
+        $updateLog.Text = "Put back to match the repository: " + (($local | ForEach-Object { $_.Substring(3) }) -join ', ') + "`r`n" + $updateLog.Text
     }
 }
 $checkAgain.Add_LinkClicked({ Update-Plugins })
@@ -2558,11 +2565,16 @@ function Update-Versions {
     foreach ($folder in $config.plugins.PSObject.Properties.Name) {
         $key = $hubKeys[$folder]
         $cache = Join-Path $root ".publish-cache\$($config.plugins.$folder.hubName)"
-        # Its repository: up to date with plugins\<folder> here, or with changes to push (never pushed counts as changes)
-        $last = if (Test-Path (Join-Path $cache '.git')) { (git -C $cache log -1 --grep='From BradsMultiTool' --format=%B 2>$null | Out-String) } else { '' }
+        # Its repository: up to date with plugins\<folder> here, or with changes to push. What it has comes from GitHub
+        # (repo-state.ps1, in the background), so every PC says the same; this PC's push cache until that's in
+        $remote = if ($script:repoState) { $script:repoState.$folder } else { $null }
+        $last = if ($remote -and $remote.ok -and $remote.from) { "From BradsMultiTool $($remote.from)" }
+                elseif (Test-Path (Join-Path $cache '.git')) { (git -C $cache log -1 --grep='From BradsMultiTool' --format=%B 2>$null | Out-String) } else { '' }
         $behind = $true
         $lastPushed = $null
-        $repoTip = "Not pushed from this PC yet: Push to repos sends it"
+        $repoTip = if ($remote -and $remote.ok) { "Its repository has never been pushed to from here: Push to repos sends it" }
+                   elseif ($script:repoState) { "Couldn't ask GitHub what its repository has (offline?): Push to repos sends it" }
+                   else { "Asking GitHub what its repository has..." }
         if ($head -and $last -match 'BradsMultiTool ([0-9a-f]{7,40})') {
             $lastPushed = $Matches[1]
             git -C $root cat-file -e "$lastPushed^{commit}" 2>$null
@@ -2588,8 +2600,8 @@ function Update-Versions {
         }
         $script:repoStates[$folder] = $behind
         $gradle = Join-Path $cache 'build.gradle'
-        $version = $null
-        if (Test-Path $gradle) {
+        $version = if ($remote -and $remote.ok -and $remote.version) { $remote.version } else { $null }
+        if (-not $version -and (Test-Path $gradle)) {
             $found = Select-String -Path $gradle -Pattern "^version = '([^']+)'" | Select-Object -First 1
             if ($found) { $version = $found.Matches[0].Groups[1].Value }
         }
@@ -2598,7 +2610,7 @@ function Update-Versions {
             continue
         }
         # The commit it was last pushed from, and whether this plugin's code changed after it
-        $from = (git -C $cache log -1 --grep='From BradsMultiTool' --format=%B 2>$null | Out-String)
+        $from = $last
         $changed = $false
         if ($code -and $from -match 'BradsMultiTool ([0-9a-f]{7,40})') {
             $pushed = $Matches[1]
@@ -2664,6 +2676,8 @@ $autoUpdate.Add_Tick({
             $behind = (git -C $dir rev-list --count "HEAD..$($upstream.Trim())" 2>$null)
             if ($LASTEXITCODE -eq 0 -and [int]$behind -gt 0) { $behindAny = $true }
         }
+        # (and anything changed here in git's files: this copy is always the repository's)
+        if (@(git -C $root status --porcelain --untracked-files=no 2>$null | Where-Object { $_ }).Count -gt 0) { $behindAny = $true }
         if ($behindAny) { Update-Plugins }
         Check-RunningVersion
         Update-Versions
@@ -2781,6 +2795,8 @@ $devPoll.Add_Tick({
         }
         $script:publishRun = $null
         Update-Versions
+        # A push changes what the repositories have: ask GitHub again
+        $script:repoNext = Get-Date
         # A publish changes the pull requests: check them again
         if ($script:devStep -eq 'hub') { $script:hubNext = Get-Date }
     }
@@ -2900,9 +2916,29 @@ function Read-HubCheck {
     }
 }
 
+# What each plugin's repository has, asked of GitHub in the background (on opening, after a push, then every 30
+# minutes): the Dev tab's up-to-date dots and versions come from it, the same on every PC
+$repoStateFile = Join-Path $root '.repo-state.json'
+$script:repoState = $null
+$script:repoRun = $null
+$script:repoNext = Get-Date
+function Start-RepoState {
+    if ($friends -or ($script:repoRun -and -not $script:repoRun.HasExited) -or -not (Test-Path $publishConfig)) { return }
+    $script:repoNext = (Get-Date).AddMinutes(30)
+    $script:repoRun = Start-Process -FilePath 'powershell.exe' -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-WindowStyle', 'Hidden', '-File', "`"$(Join-Path $root 'scripts\repo-state.ps1')`"", '-Root', "`"$root`"" -WindowStyle Hidden -PassThru
+}
+function Read-RepoState {
+    $script:repoRun = $null
+    try { $script:repoState = (Get-Content $repoStateFile -Raw | ConvertFrom-Json).repos } catch { }
+    Update-Versions
+}
+
 $hubTimer = New-Object System.Windows.Forms.Timer
 $hubTimer.Interval = 2000
 $hubTimer.Add_Tick({
+    if ($script:repoRun -and $script:repoRun.HasExited) { Read-RepoState }
+    elseif (-not $script:repoRun -and (Get-Date) -ge $script:repoNext) { Start-RepoState }
     if ($script:hubRun) {
         if ($script:hubRun.HasExited) { Read-HubCheck }
         return
